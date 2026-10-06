@@ -1,0 +1,147 @@
+name: 'Provision Container App Infrastructure'
+
+on:
+  workflow_dispatch:
+    inputs:
+      
+      dev:
+        description: 'Dev Environment'
+        required: false
+        default: false
+        type: boolean
+
+      prod:
+        description: 'Prod Environment'
+        required: false
+        default: false
+        type: boolean
+        
+      action:
+        description: 'Create or Delete Resources'
+        required: true
+        default: 'Create'
+        type: choice
+        options:
+          - Create
+          - Delete
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    env:
+      DEV: ${{ inputs.Dev }}
+      PROD: ${{ inputs.Prod }}
+    outputs: 
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: build matrix
+        id: matrix
+        run: |
+          environments=()
+          if [[ "$DEV" == "true" ]]; then
+            environments+=("dev")
+          fi
+          if [[ "$PROD" == "true" ]]; then
+            environments+=("prod")
+          fi
+          matrix=$(printf '%s\n' "${environments[@]}" | jq -R . | jq -sc '{environments: .}')
+          echo "Matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  terraform:
+    needs: prepare
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v3
+        
+      - name: Azure Login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          
+      - name: check resource groups
+        id: check_rg
+        run: |
+          if az group show --name "${{ vars.RESOURCE_GROUP }}_${{ matrix.environments }}" > /dev/null 2>&1; then
+            echo "Resource group exists: ${{ vars.RESOURCE_GROUP }}_${{ matrix.environments }}"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Resource group does not exist: ${{ vars.RESOURCE_GROUP }}_${{ matrix.environments }}"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Terraform
+        uses: little-core-labs/install-terraform@v2.0.0
+        with:
+          # Version of terraform to download
+          version: 1.5.0
+      
+      - name: run terraform
+        if: steps.check_rg.outputs.exists == 'false' && inputs.action == 'Create'
+        working-directory: Code/terraform/environments/${{ matrix.environments }}
+        run: |
+           sed -i 's/^/#/' state_backend.tf
+           terraform init
+           terraform apply -auto-approve \
+            -var "image_name=${{ inputs.image }}" \
+            -var "image_tag=${{ inputs.image_tag }}" 
+
+      - name: sync state to backend
+        if: steps.check_rg.outputs.exists == 'false' && inputs.action == 'Create' && always()
+        working-directory: Code/terraform/environments/${{ matrix.environments }}
+        run: |
+           sed -i 's/^#//' state_backend.tf
+           terraform init -migrate-state -force-copy
+
+      - name: set db environment variables
+        if: steps.check_rg.outputs.exists == 'false' && inputs.action == 'Create'
+        working-directory: Code/terraform/environments/${{ matrix.environments }}
+        run: |
+          terraform init
+          echo "Setting database environment variables for dev environment"
+          DB_SERVER_FQDN="$(terraform output -raw db_server_fqdn)"
+          ADMIN_USERNAME="$(terraform output -raw admin_username)"
+          DB_NAME="$(terraform output -raw db_name)"
+          
+          echo "DB_SERVER_FQDN=$DB_SERVER_FQDN" >> $GITHUB_ENV
+          echo "ADMIN_USERNAME=$ADMIN_USERNAME" >> $GITHUB_ENV
+          echo "DB_NAME=$DB_NAME" >> $GITHUB_ENV
+      
+      - name: init_database
+        if: steps.check_rg.outputs.exists == 'false' && inputs.action == 'Create'
+        working-directory: Code/scripts
+        env:
+          DB_HOST: ${{ env.DB_SERVER_FQDN }}
+          DB_USER: ${{ env.ADMIN_USERNAME }}
+          DB_NAME: ${{ env.DB_NAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          echo "Initializing database for dev environment"
+          pip install psycopg2-binary
+          python db_init.py
+
+      - name: Remove resources
+        if: inputs.action == 'Delete' 
+        working-directory: Code/terraform/environments/${{ matrix.environments }}
+        run: |
+           terraform init
+           terraform destroy -auto-approve
+  
+  log-analysis:
+    needs: terraform
+    if: ${{ failure() }}
+    uses: ./.github/workflows/log-analysis.yml
+    secrets: inherit

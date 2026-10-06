@@ -1,0 +1,175 @@
+
+name: 'Auto Update Infrastructure'
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'Code/terraform/**'
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+  pull-requests: write
+
+
+jobs:
+  check:
+    if: github.event.issue.pull_request 
+    runs-on: ubuntu-latest
+
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      changed_folders: ${{ steps.check.outputs.changed_folders }}
+      action_folders: ${{ steps.action_folder.outputs.action_folders }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check changed files
+        id: check
+        run: |
+          git fetch origin ${{ github.event.issue.pull_request.base.ref }}
+          git fetch origin ${{ github.event.issue.pull_request.head.ref }}
+
+          CHANGED=$(git diff --name-only \
+            origin/${{ github.event.issue.pull_request.base.ref }}...origin/${{ github.event.issue.pull_request.head.ref }} | grep '/terraform/' | xargs dirname )
+
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          if echo "$CHANGED" | grep -q '/terraform/'; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "changed_folders=$CHANGED" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+          
+      - name: Decide terraform folders
+        if: steps.check.outputs.should_run == 'true'
+        id: action_folder
+        run: |
+          files1=$(echo "${{ steps.check.outputs.changed_files }}" | grep '/terraform/' | grep -v '/modules/')
+          modules=$(echo "${{ steps.check.outputs.changed_files }}" | grep '/modules/')
+          for module in modules
+          do
+            module_ref=$(echo $module | cut -d'/' -f4)
+            env_folder=$(grep -rl "$module_ref" Code/terraform/environments/ | xargs dirname )
+            files1+=$env_folder
+          done
+          echo "action_folders=$files1" >> "$GITHUB_OUTPUT"
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post instructions comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `
+            ### 👋 Thanks for opening this pull request!
+                  Please follow these instructions:
+          
+                  - Comment "terraform plan" to see what will changes
+                  - Comment "terraform apply" when you review the plan result.  
+                  
+                  Thanks!`;
+                  
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body});
+            
+  terraform-plan:
+    needs: check
+    if: needs.check.outputs.should_run == 'true' && github.event.comment.body == 'terraform plan'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Terraform
+        uses: little-core-labs/install-terraform@v2.0.0
+        with:
+          # Version of terraform to download
+          version: 1.5.0
+      
+      - name: Terraform fmt
+        run: |
+          for folder in ${{ needs.check.outputs.changed_folders }}
+          do
+            pushd folder
+            terraform fmt -check
+            popd
+          done
+      - name: Terraform plan
+        run: |
+          for folder in ${{ needs.check.outputs.action_folders }}
+          do
+            pushd folder
+            terraform init
+            terraform plan -no-color >> ${{ github.workspace }}/plan.txt
+            popd
+          done
+      - name: Comment Terraform Plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const plan = fs.readFileSync(
+              '${{ github.workspace }}/plan.txt',
+              'utf8'
+            );
+
+            const body = `## Terraform Plan
+
+            <details>
+            <summary>Show Terraform Plan</summary>
+
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+
+            </details>`;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+  
+  terraform-apply:
+    needs: check
+    if: needs.check.outputs.should_run == 'true' && github.event.comment.body == 'terraform apply'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Terraform
+      uses: little-core-labs/install-terraform@v2.0.0
+      with:
+        # Version of terraform to download
+        version: 1.5.0
+        
+    - name: Terraform apply
+      run: |
+        for folder in ${{ needs.check.outputs.action_folders }}
+        do
+          pushd folder
+          terraform init
+          terraform apply -auto-approve
+          popd
+        done
+  
+
+  log-analysis:
+    needs: 
+      - terraform-plan
+      - terraform-apply
+    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    uses: ./.github/workflows/log-analysis.yml
+    secrets: inherit

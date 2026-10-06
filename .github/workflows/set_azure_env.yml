@@ -1,0 +1,135 @@
+name: Setup base environment for container app
+
+on:
+  workflow_dispatch:
+    inputs:
+      Action:
+        description: 'Create or Delete Resources'
+        required: true
+        default: 'Create'
+        type: choice
+        options:
+          - Create
+          - Delete
+
+      Region:
+        description: 'Azure region'
+        required: true
+        default: 'East Asia'
+        type: string
+
+      ResourceGroupName:
+        description: 'Resource group name'
+        required: true
+        default: 'demo-rg_base'
+        type: string
+      
+      StorageAccount:
+        description: "Storage account for tf backend"
+        required: true
+        default: "lincolnstorageacct693"
+        type: string
+      
+      keyvault:
+        description: "Key vault name"
+        required: true
+        default: "lincolnkeyvault693"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+  pull-requests: write
+
+jobs:
+  set-azure-env:
+    runs-on: ubuntu-latest
+    env:
+      RG: ${{ inputs.ResourceGroupName }} 
+      SA: ${{ inputs.StorageAccount}}
+      Region: ${{ inputs.Region }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Azure Login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          
+      - name: Check  RG &storage account existance
+        id: check
+        run: |
+          
+          echo "Checking Resource Group: $RG"
+          if az group show --name "$RG" &>/dev/null; then
+            echo "Resource Group exists"
+            echo "resource_group_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Resource Group does NOT exist"
+            echo "resource_group_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Checking Storage Account: $SA"
+          if az storage account show --name "$SA" --resource-group "$RG" &>/dev/null; then
+            echo "Storage Account exists"
+            echo "storage_account_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Storage Account does NOT exist"
+            echo "storage_account_exists=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Install Terraform
+        uses: little-core-labs/install-terraform@v2.0.0
+        with:
+          # Version of terraform to download
+          version: 1.5.0
+
+      - name: Create RG
+        if: inputs.Action == 'Create' 
+        working-directory: ./Code/terraform/environments/base
+        run: |
+          terraform init
+          terraform apply -auto-approve \
+            -var "resource_group_name=$RG" \
+            -var "rg_location=$Region" \
+            -var "storage_account_name=$SA" \
+            -var "key_vault_name=${{ inputs.keyvault }}" \
+          
+
+      - name: Create Key Vault Secret
+        if: inputs.Action == 'Create'
+        run: |
+          echo "Creating Key Vault Secret"
+         
+          az keyvault secret set \
+            --vault-name "${{ inputs.keyvault }}" \
+            --name "db-password" \
+            --value "${{ secrets.DB_PASSWORD }}" \
+            --output none
+          
+          SECRET_ID=$(az keyvault secret show \
+          --vault-name "${{ vars.KEY_VAULT_NAME }}" \
+          --name "db-password" \
+          --query id \
+          --output tsv)
+
+            
+      - name: Clear Resources
+        if: steps.check.outputs.resource_group_exists == 'true' && inputs.Action == 'Delete'
+        run: |
+          echo "Deleting resource group: $RG"
+          az group delete \
+            --name "$RG" \
+            --yes \
+            --no-wait   # optional: don't wait for completion
+
+  log-analysis:
+    needs: set-azure-env
+    if: ${{ failure() }}
+    uses: ./.github/workflows/log-analysis.yml
+    secrets: inherit

@@ -1,0 +1,61 @@
+name: 'Deploy Image to Production/Dev Environment'
+
+on:
+  workflow_dispatch:
+    inputs:
+      dev:
+        description: 'Dev Environment'
+        required: false
+        default: false
+        type: boolean
+
+      prod:
+        description: 'Prod Environment'
+        required: false
+        default: true
+        type: boolean
+          
+      image_registry:
+        description: 'Image registry to be deployed'
+        required: false
+        default: "lincolnregistry693.azurecr.io"
+        type: string
+
+      image_name:
+        description: 'Image name to be deployed'
+        required: false
+        default: "web_app"
+        type: string
+
+      image_tag:
+        description: 'Image tag to be deployed'
+        required: false
+        default: "latest"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  Dev:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dev == 'true' }}
+    steps:
+      - name: deploy
+        uses: ./.github/actions/deploy
+        with: 
+          image: "${{ inputs.image_registry }}/${{ inputs.image_name }}:${{ inputs.image_tag }}"
+          app_name: "${{ vars.CONTAINER_APP_NAME_DEV }}"
+          resource_group: "${{ vars.RESOURCE_GROUP_DEV }}"
+    
+  Prod:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.prod == 'true' }}
+    steps:
+      - name: deploy
+        uses: ./.github/actions/deploy
+        with: 
+          image: "${{ inputs.image_registry }}/${{ inputs.image_name }}:${{ inputs.image_tag }}"
+          app_name: "${{ vars.CONTAINER_APP_NAME_PROD }}"
+          resource_group: "${{ vars.RESOURCE_GROUP_PROD }}" 

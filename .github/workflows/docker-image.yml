@@ -1,0 +1,72 @@
+name: Build Docker Image on PR
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'Code/web_app/**'
+  
+  issue_comment:
+    types: created
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  id-token: write
+  actions: write
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post instructions comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `
+            ### 👋 Thanks for opening this pull request!
+                  Please follow these instructions:
+          
+                  - Comment "deploy dev" to deploy this PR to Dev environment.
+                   
+                  Thanks!`;
+                  
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body});
+
+  docker_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v3
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: build
+        id: build               
+        uses: ./.github/actions/docker_build
+        with:
+          tag: "pr-${{ github.event.pull_request.number }}"
+        
+      - name: deploy
+        if: github.event.comment.body == 'deploy dev'
+        uses: ./.github/actions/deploy
+        with: 
+          image: "${{ steps.build.outputs.image }}"
+          app_name: "${{ vars.CONTAINER_APP_NAME_DEV }}"
+          resource_group: "${{ vars.RESOURCE_GROUP_DEV }}"
+
+  log-analysis:
+    needs: docker_build
+    if: ${{ failure() }}
+    uses: ./.github/workflows/log-analysis.yml
+    secrets: inherit

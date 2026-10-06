@@ -1,0 +1,43 @@
+name: 'deploy composite Action'
+description: 'deploy action'
+
+inputs:
+  image:
+    description: 'The image to deploy'
+    required: true
+    type: string
+    default: ''
+
+  app_name: 
+    description: 'the name of azure container app'
+    required: true
+    type: string
+    default: ''
+
+  resource_group: 
+    description: 'the name of resource group'
+    required: true
+    type: string
+    default: ''
+
+  
+runs:
+  using: "composite"
+  steps:
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.ARM_CLIENT_ID }}
+        tenant-id: ${{ secrets.ARM_TENANT_ID }}
+        subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+    - name: Deploy to Azure
+      env:
+        CONTAINER_APP_NAME: ${{ inputs.app_name }}
+        RESOURCE_GROUP: ${{ inputs.resource_group }} 
+      run: |
+        
+        az containerapp update \
+          --name "$CONTAINER_APP_NAME" \
+          --resource-group "$RESOURCE_GROUP" \
+          --image "${{ inputs.image }}"

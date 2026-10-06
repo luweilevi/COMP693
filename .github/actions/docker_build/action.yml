@@ -1,0 +1,86 @@
+name: 'Docker build Composite Action'
+description: 'composite action for docker build'
+
+inputs:
+  tag:
+    description: 'image tag'
+    required: true
+    default: 'latest'
+    type: string
+  dockerfile:
+    description: 'location of dockerfile'
+    required: false
+    type: string
+
+outputs:
+  image: 
+    description: 'The docker image '
+    value: ${{ steps.docker_image.outputs.image }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Find Dockerfile
+      id: find-dockerfile
+      shell: bash
+      run: |
+        DOCKERFILE_PATH=$(find . -iname "dockerfile" -type f | head -n 1)
+        
+        if [ -z "$DOCKERFILE_PATH" ]; then
+          echo "❌ No Dockerfile found"
+          exit 1
+        fi
+    
+        # Remove leading ./
+        DOCKERFILE_PATH=${DOCKERFILE_PATH#./}
+        
+        # Get the directory containing the Dockerfile
+        CONTEXT_DIR=$(dirname "$DOCKERFILE_PATH")
+        
+        echo "dockerfile=$DOCKERFILE_PATH" >> $GITHUB_OUTPUT
+        echo "context=$CONTEXT_DIR" >> $GITHUB_OUTPUT
+        
+        echo "✅ Dockerfile : $DOCKERFILE_PATH"
+        echo "✅ Context    : $CONTEXT_DIR"
+
+    - name: Get Registry name
+      id: registry
+      shell: bash
+      run: |
+        REGISTRY_NAME=$(grep -r '^[[:space:]]*container_registry_name[[:space:]]*=' Code/terraform/environments/ | head -n 1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+        echo "REGISTRY_NAME=$REGISTRY_NAME.azurecr.io" >> "$GITHUB_OUTPUT"
+        
+    - name: Login to ACR
+      shell: bash
+      run: |
+        az acr login --name "${{ steps.registry.outputs.REGISTRY_NAME }}"
+    
+    - name: Build and push
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ steps.find-dockerfile.outputs.context }}
+        file: ${{ steps.find-dockerfile.outputs.dockerfile }}
+        push: true
+        tags: ${{steps.registry.outputs.REGISTRY_NAME}}/web_app:${{ inputs.tag }}
+    
+    - name: output image
+      id: docker_image
+      shell: bash
+      run: |
+        echo "IMAGE=${{steps.registry.outputs.REGISTRY_NAME}}/web_app:${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+
+
+    - name: Post Build Result comment
+      if: github.event_name == 'pull_request'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+          COMMENT=$(cat <<EOF
+          ### 👋 Thanks for opening this pull request!
+
+                Image was successfully built: ${{ steps.docker_image.outputs.IMAGE }} 
+                EOF
+          )
+                
+          gh pr comment "$PR_NUMBER" --body "$COMMENT"

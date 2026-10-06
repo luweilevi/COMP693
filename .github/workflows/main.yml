@@ -1,0 +1,39 @@
+name: Build Docker Image on Main Branch
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'Code/web_app/**'
+  
+
+permissions:
+  contents: read
+  id-token: write
+  actions: write
+
+jobs:
+  docker_build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v3
+      
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.ARM_CLIENT_ID }}
+          tenant-id: ${{ secrets.ARM_TENANT_ID }}
+          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+      - name: build
+        id: build               
+        uses: ./.github/actions/docker_build
+        with:
+          tag: "main-${{ github.sha }}"
+      
+  log-analysis:
+    needs: docker_build
+    if: ${{ failure() }}
+    uses: ./.github/workflows/log-analysis.yml
+    secrets: inherit

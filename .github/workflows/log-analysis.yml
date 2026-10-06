@@ -1,0 +1,177 @@
+name: Log analysis
+
+on:
+  workflow_call:
+
+jobs:
+  log-check:
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      pull-requests: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    # - name: Azure Login
+    #   uses: azure/login@v2
+    #   with:
+    #     client-id: ${{ secrets.ARM_CLIENT_ID }}
+    #     tenant-id: ${{ secrets.ARM_TENANT_ID }}
+    #     subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+    - name: Get error log
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Get the failed job ID
+        JOB_ID=$(gh api \
+          "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
+          --jq '.jobs[0].id')
+
+        echo "JOB_ID=$JOB_ID"
+
+        # Download job log
+        gh api \
+          --allow-escape-sequences \
+          "/repos/$GITHUB_REPOSITORY/actions/jobs/$JOB_ID/logs" \
+          > job.log
+
+        echo "Downloaded job log"
+        # extract failed steps
+        awk '
+            /^.*##\[group\]Run / {
+                in_step=1
+                step=$0
+                buffer=$0 "\n"
+                next
+            }
+            in_step {
+                buffer = buffer $0 "\n"
+            }
+            /^.*##\[error\]Process completed with exit code/ {
+                print buffer
+                in_step=0
+                buffer=""
+            }
+            ' job.log > failed_step.log
+        
+
+    - name: analyse captured error
+      id: analyse
+      env:
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      run: |
+        FAILED_LOG=$(cat failed_step.log)
+
+        SYSTEM_PROMPT='
+          You are a DevOps troubleshooting assistant specializing in GitHub Actions.
+          Your job is to analyze GitHub Actions workflow failures.
+          Rules:
+          - Be concise and practical.
+          - Do not repeat the entire log.
+          - Do not include greetings or conversational text.
+          - Do not use a generic introduction.
+          - Quote only short and relevant error messages.
+          - Identify the actual root cause from the provided logs.
+          - Explain the failure in clear technical language.
+          - Provide a practical fix or specific next troubleshooting step.
+          - If the logs are insufficient, clearly state what additional information is needed.
+          - Keep the response concise and suitable for a CI/CD engineer.
+
+          Return exactly these three sections:
+          Error log:
+          The most relevant error message or log evidence.
+          Root cause:
+          A short explanation of the failure.
+          Recommended fix:
+          The most practical fix or next troubleshooting step.
+          '
+
+          RESPONSE=$(curl -s -X POST \
+          "https://generativelanguage.googleapis.com/v1beta/interactions" \
+          -H "x-goog-api-key: $GEMINI_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg input "$FAILED_LOG" \
+            '{
+              model: "gemini-3.8-flash",
+
+              system_instruction: $system,
+
+              input: $input,
+
+              response_format: {
+                type: "text",
+                mime_type: "application/json",
+                schema: {
+                  type: "object",
+                  properties: {
+                    error_log: {
+                      type: "string"
+                    },
+                    root_cause: {
+                      type: "string"
+                    },
+                    recommended_fix: {
+                      type: "string"
+                    }
+                  },
+                  required: [
+                    "error_log",
+                    "root_cause",
+                    "recommended_fix"
+                  ]
+                }
+              },
+
+              generation_config: {
+                max_output_tokens: 500,
+                thinking_level: "low"
+              }
+            }'
+          )")
+
+            ANALYSIS=$(echo "$RESPONSE" | jq -r '.steps[] | select(.type == "model_output") | .content[]')
+
+          {
+            echo 'analysis<<EOF'
+            echo "$ANALYSIS"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+    
+    - name: Comment analysis on PR
+      if: github.event_name == 'pull_request'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ANALYSIS: ${{ steps.analyse.outputs.analysis }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+      
+        ERROR_LOG=$(echo "$ANALYSIS" | jq -r '.text' | jq -r '.error_log')
+        ROOT_CAUSE=$(echo "$ANALYSIS" | jq -r ' .text' | jq -r '.root_cause')
+        RECOMMENDED_FIX=$(echo "$ANALYSIS" | jq -r ' .text' | jq -r '.recommended_fix')
+
+        COMMENT=$(cat <<EOF
+        ## 🤖 CI Failure Analysis
+
+        ### Error log
+
+        \`$ERROR_LOG\`
+
+        ### Root cause
+
+        $ROOT_CAUSE
+
+        ### Recommended fix
+
+        $RECOMMENDED_FIX
+        EOF
+        )
+        
+        gh pr comment "$PR_NUMBER" --body "$COMMENT"
